@@ -305,11 +305,27 @@ run_preflight() {
             { warn "Conflicting package: ${pkg} — may conflict with GitLab nginx."; ((warnings++)); }
     done
 
-    # Port 80 conflict
-    ss -tlnp 2>/dev/null | grep -q ':80 ' && {
-        local h; h=$(ss -tlnp 2>/dev/null | grep ':80 ' | awk '{print $NF}' | head -1)
-        warn "Port 80 already in use: ${h}"; ((warnings++))
-    }
+    # Port 80 conflict — only flag if it is NOT GitLab's own bundled nginx
+    if ss -tlnp 2>/dev/null | grep -q ':80 '; then
+        local p80_pids p80_owner
+        # Collect all PIDs listening on :80
+        p80_pids=$(ss -tlnp 2>/dev/null | grep ':80 ' | grep -oP 'pid=\K[0-9]+' | sort -u)
+        p80_owner=""
+        for pid in $p80_pids; do
+            local exe; exe=$(readlink -f /proc/"$pid"/exe 2>/dev/null || echo "")
+            if [[ "$exe" != /opt/gitlab/* ]]; then
+                p80_owner="$exe (pid $pid)"
+                break
+            fi
+        done
+        if [[ -n "$p80_owner" ]]; then
+            warn "Port 80 in use by non-GitLab process: ${p80_owner}"
+            warn "GitLab's nginx also needs port 80. Remove or stop this service first."
+            ((warnings++))
+        else
+            success "Port 80 in use by GitLab's own nginx — not a conflict."
+        fi
+    fi
 
     # systemd state
     local sd; sd=$(systemctl is-system-running 2>/dev/null || echo "unknown")
@@ -586,8 +602,29 @@ GITLABRB
 install_step_system_prep() {
     step "STEP 1 — System Preparation"
     state_done "system_prep" && { info "Already done — skipping."; return; }
+
+    # Fix any corrupt secrets BEFORE apt-get upgrade, which triggers dpkg to
+    # reconfigure already-installed packages including a broken gitlab-ce.
+    fix_corrupt_secrets || true
+
+    # If gitlab-ce is in a broken dpkg state, hold it so apt-get upgrade
+    # does not try to reconfigure it (and fail) before we are ready.
+    local gl_held=false
+    if dpkg -l gitlab-ce 2>/dev/null | grep -qE "^(iF|iU|ih)"; then
+        warn "gitlab-ce is in a broken dpkg state — holding it during system upgrade."
+        apt-mark hold gitlab-ce 2>/dev/null || true
+        gl_held=true
+    fi
+
     apt-get update -qq 2>&1 | tee -a "$LOG_FILE"
-    DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq 2>&1 | tee -a "$LOG_FILE"
+    DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq 2>&1 | tee -a "$LOG_FILE" || true
+
+    # Release the hold now that the general upgrade is done
+    if [[ "$gl_held" == "true" ]]; then
+        apt-mark unhold gitlab-ce 2>/dev/null || true
+        info "gitlab-ce hold released."
+    fi
+
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
         curl ca-certificates tzdata perl ufw apt-transport-https \
         gnupg2 lsb-release net-tools postfix 2>&1 | tee -a "$LOG_FILE"
@@ -939,6 +976,12 @@ main() {
     echo -e "  ${BOLD}Plan: ${CYAN}${INSTALL_ACTION}${NC}"
     confirm "Ready to proceed?" "y" || { info "Aborted."; exit 0; }
     echo ""
+
+    # Run secrets fix immediately — before step 1 touches apt.
+    # This prevents apt-get upgrade from triggering dpkg reconfigure
+    # on a broken gitlab-ce that has a corrupt secrets file.
+    info "Pre-install check: scanning for corrupt GitLab secrets file..."
+    fix_corrupt_secrets || true
 
     install_step_system_prep
     install_step_add_repo
