@@ -9,7 +9,7 @@
 #    sudo bash install-gitlab.sh --verify-only # health check only
 #
 #  One-liner:
-#    bash <(curl -fsSL https://your-host/install-gitlab.sh)
+#    bash <(curl -fsSL https://raw.githubusercontent.com/centopw/gitlab-installer/refs/heads/main/install-gitlab.sh)
 #
 #  Unattended (env vars):
 #    GITLAB_DOMAIN=git.example.com GIT_SSH_PORT=2222 \
